@@ -137,41 +137,39 @@ def list_all_tickets() -> list[Ticket]:
             ) for r in rows
         ]
 
-status_labels = {
-    TicketStatus.NEW.value: "новая",
-    TicketStatus.ACCEPTED.value: "принята",
-    TicketStatus.REJECTED.value: "отклонена"
-}
-
 def format_ticket(t: Ticket) -> str:
-    username_part = f"@{t.username}" if t.username else "(нет username)"
     return (f"заявка #{t.id}\n"
-            f"пользователь: {username_part} (id {t.user_id})\n"
+            f"юзер: @{t.username} (id {t.user_id})\n"
             f"номер: {t.phone if t.phone else 'не указан'}\n"
-            f"статус: {status_labels.get(t.status, t.status)}\n"
-            f"создана: {t.created_at}")
+            f"статус: {t.status}")
 
 def ticket_keyboard(ticket_id: int):
     markup = telebot.types.InlineKeyboardMarkup()
     markup.row(
-        telebot.types.InlineKeyboardButton("✅ принять", callback_data=f"accept:{ticket_id}"),
-        telebot.types.InlineKeyboardButton("❌ отклонить", callback_data=f"reject:{ticket_id}")
+        telebot.types.InlineKeyboardButton("принять", callback_data=f"accept:{ticket_id}"),
+        telebot.types.InlineKeyboardButton("отклонить", callback_data=f"reject:{ticket_id}")
     )
     return markup
 
 @bot.message_handler(commands=['start'])
 def start(m):
     user = m.from_user
+    if user.id == admin_id:
+        bot.reply_to(m, "вы админ, отправьте номер для спама")
+        return
     last = get_last_ticket_by_user(user.id)
     if last:
         if last.status == TicketStatus.ACCEPTED.value:
             bot.reply_to(m, "вы уже приняты, отправьте номер для спама")
             return
         elif last.status == TicketStatus.NEW.value:
-            bot.reply_to(m, "у вас уже есть заявка на рассмотрении, ожидайте")
+            bot.reply_to(m, "заявка уже на рассмотрении")
+            return
+        else:
+            bot.reply_to(m, "вы отклонены, идите нахуй")
             return
     t = create_ticket(user.id, user.username or "", "")
-    bot.reply_to(m, "заявка отправлена администратору, ожидайте одобрения")
+    bot.reply_to(m, "заявка отправлена админу")
     bot.send_message(admin_id, format_ticket(t), reply_markup=ticket_keyboard(t.id))
 
 @bot.message_handler(commands=['stop'])
@@ -207,28 +205,34 @@ def callback(call):
         bot.answer_callback_query(call.id, "заявка не найдена", show_alert=True)
         return
     if t.status != TicketStatus.NEW.value:
-        bot.answer_callback_query(call.id, f"уже обработана: {status_labels[t.status]}", show_alert=True)
+        bot.answer_callback_query(call.id, f"уже обработана: {t.status}", show_alert=True)
         return
     if action == "accept":
         update_ticket_status(ticket_id, TicketStatus.ACCEPTED)
-        user_msg = "ваша заявка принята, теперь вы можете отправить номер для спама"
+        user_msg = "ваша заявка принята, отправьте номер для спама"
+        admin_msg = f"заявка #{ticket_id} принята"
     else:
         update_ticket_status(ticket_id, TicketStatus.REJECTED)
-        user_msg = "ваша заявка отклонена, напишите /start для повторной"
-    t = get_ticket(ticket_id)
-    bot.edit_message_text(format_ticket(t), call.message.chat.id, call.message.message_id)
+        user_msg = "иди нахуй"
+        admin_msg = f"заявка #{ticket_id} отклонена"
     try:
         bot.send_message(t.user_id, user_msg)
     except Exception as e:
         logger.warning(f"не отправить юзеру {t.user_id}: {e}")
+    bot.delete_message(call.message.chat.id, call.message.message_id)
+    bot.send_message(admin_id, admin_msg)
     bot.answer_callback_query(call.id, "готово")
 
 @bot.message_handler(func=lambda m: True)
 def handle(m):
-    last = get_last_ticket_by_user(m.from_user.id)
-    if not last or last.status != TicketStatus.ACCEPTED.value:
-        bot.reply_to(m, "ваша заявка не принята, напишите /start")
-        return
+    if m.from_user.id == admin_id:
+        # админ сразу может спамить
+        pass
+    else:
+        last = get_last_ticket_by_user(m.from_user.id)
+        if not last or last.status != TicketStatus.ACCEPTED.value:
+            bot.reply_to(m, "ваша заявка не принята, напишите /start")
+            return
     phone = ''.join(filter(str.isdigit, m.text.strip()))
     if len(phone) < 10:
         bot.reply_to(m, "не номер")
@@ -236,9 +240,6 @@ def handle(m):
     if m.chat.id in active:
         bot.reply_to(m, "уже спамим")
         return
-    with closing(get_conn()) as conn:
-        conn.execute("update tickets set phone = ? where id = ?", (phone, last.id))
-        conn.commit()
     bot.reply_to(m, "спамлю")
     def worker(chat_id, phone):
         ua = UserAgent()
