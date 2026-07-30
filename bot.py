@@ -39,6 +39,8 @@ db_path = "tickets.db"
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+bot_paused = False
+
 class TicketStatus(str, Enum):
     NEW = "new"
     ACCEPTED = "accepted"
@@ -72,11 +74,11 @@ def init_db():
         """)
         conn.commit()
 
-def create_ticket(user_id: int, username: str, phone: str = "") -> Ticket:
+def create_ticket(user_id: int, username: str, phone: str = "", status: str = TicketStatus.NEW.value) -> Ticket:
     with closing(get_conn()) as conn:
         cur = conn.execute(
             "insert into tickets (user_id, username, phone, status, created_at) values (?, ?, ?, ?, ?)",
-            (user_id, username, phone, TicketStatus.NEW.value, datetime.now().isoformat(timespec="seconds"))
+            (user_id, username, phone, status, datetime.now().isoformat(timespec="seconds"))
         )
         conn.commit()
         ticket_id = cur.lastrowid
@@ -123,6 +125,11 @@ def update_ticket_status(ticket_id: int, status: TicketStatus):
         conn.execute("update tickets set status = ? where id = ?", (status.value, ticket_id))
         conn.commit()
 
+def update_ticket_phone(ticket_id: int, phone: str):
+    with closing(get_conn()) as conn:
+        conn.execute("update tickets set phone = ? where id = ?", (phone, ticket_id))
+        conn.commit()
+
 def list_all_tickets() -> list[Ticket]:
     with closing(get_conn()) as conn:
         rows = conn.execute("select * from tickets order by id desc").fetchall()
@@ -136,6 +143,30 @@ def list_all_tickets() -> list[Ticket]:
                 created_at=r["created_at"]
             ) for r in rows
         ]
+
+def list_active_users() -> list[Ticket]:
+    with closing(get_conn()) as conn:
+        rows = conn.execute("select * from tickets where status in ('new','accepted') order by id desc").fetchall()
+        return [
+            Ticket(
+                id=r["id"],
+                user_id=r["user_id"],
+                username=r["username"],
+                phone=r["phone"],
+                status=r["status"],
+                created_at=r["created_at"]
+            ) for r in rows
+        ]
+
+def clear_db():
+    with closing(get_conn()) as conn:
+        conn.execute("delete from tickets")
+        conn.commit()
+
+def get_all_accepted_users() -> list[int]:
+    with closing(get_conn()) as conn:
+        rows = conn.execute("select user_id from tickets where status = 'accepted' group by user_id").fetchall()
+        return [r["user_id"] for r in rows]
 
 def format_ticket(t: Ticket) -> str:
     return (f"заявка #{t.id}\n"
@@ -151,22 +182,41 @@ def ticket_keyboard(ticket_id: int):
     )
     return markup
 
+def admin_menu():
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.row(telebot.types.InlineKeyboardButton("добавить пользователя", callback_data="admin_add_user"))
+    markup.row(telebot.types.InlineKeyboardButton("заблокировать пользователя", callback_data="admin_block_user"))
+    markup.row(telebot.types.InlineKeyboardButton("очистить базу данных", callback_data="admin_clear_db"))
+    if bot_paused:
+        markup.row(telebot.types.InlineKeyboardButton("включить бота", callback_data="admin_resume"))
+    else:
+        markup.row(telebot.types.InlineKeyboardButton("временно остановить бота", callback_data="admin_pause"))
+    return markup
+
+def check_paused(message):
+    if bot_paused and message.from_user.id != admin_id:
+        bot.reply_to(message, "бот на тех работах")
+        return True
+    return False
+
 @bot.message_handler(commands=['start'])
 def start(m):
+    if check_paused(m):
+        return
     user = m.from_user
     if user.id == admin_id:
-        bot.reply_to(m, "вы админ, отправьте номер для спама")
+        bot.reply_to(m, "ты админ кидай номер")
         return
     last = get_last_ticket_by_user(user.id)
     if last:
         if last.status == TicketStatus.ACCEPTED.value:
-            bot.reply_to(m, "вы уже приняты, отправьте номер для спама")
+            bot.reply_to(m, "ты принят даун отправь номер")
             return
         elif last.status == TicketStatus.NEW.value:
             bot.reply_to(m, "заявка уже на рассмотрении")
             return
         else:
-            bot.reply_to(m, "вы отклонены, идите нахуй")
+            bot.reply_to(m, "ты отклонён иди нахуй")
             return
     t = create_ticket(user.id, user.username or "", "")
     bot.reply_to(m, "заявка отправлена админу")
@@ -174,14 +224,25 @@ def start(m):
 
 @bot.message_handler(commands=['stop'])
 def stop(m):
+    if check_paused(m):
+        return
     if m.chat.id in active:
         active[m.chat.id]['stop'] = True
         bot.reply_to(m, "остановлено")
     else:
         bot.reply_to(m, "нет спама")
 
+@bot.message_handler(commands=['admin'])
+def admin_cmd(m):
+    if m.from_user.id != admin_id:
+        bot.reply_to(m, "только админ")
+        return
+    bot.reply_to(m, "админка", reply_markup=admin_menu())
+
 @bot.message_handler(commands=['tickets'])
 def tickets_cmd(m):
+    if check_paused(m):
+        return
     if m.from_user.id != admin_id:
         bot.reply_to(m, "только админ")
         return
@@ -198,40 +259,157 @@ def callback(call):
     if call.from_user.id != admin_id:
         bot.answer_callback_query(call.id, "только админ", show_alert=True)
         return
-    action, ticket_id_str = call.data.split(":")
-    ticket_id = int(ticket_id_str)
-    t = get_ticket(ticket_id)
-    if not t:
-        bot.answer_callback_query(call.id, "заявка не найдена", show_alert=True)
+
+    data = call.data
+
+    if data.startswith("accept:") or data.startswith("reject:"):
+        action, ticket_id_str = data.split(":")
+        ticket_id = int(ticket_id_str)
+        t = get_ticket(ticket_id)
+        if not t:
+            bot.answer_callback_query(call.id, "заявка не найдена", show_alert=True)
+            return
+        if t.status != TicketStatus.NEW.value:
+            bot.answer_callback_query(call.id, f"уже обработана: {t.status}", show_alert=True)
+            return
+        if action == "accept":
+            update_ticket_status(ticket_id, TicketStatus.ACCEPTED)
+            user_msg = "ты принят даун отправь номер"
+            admin_msg = f"заявка #{ticket_id} принята"
+        else:
+            update_ticket_status(ticket_id, TicketStatus.REJECTED)
+            user_msg = "иди нахуй"
+            admin_msg = f"заявка #{ticket_id} отклонена"
+        try:
+            bot.send_message(t.user_id, user_msg)
+        except Exception as e:
+            logger.warning(f"не отправить юзеру {t.user_id}: {e}")
+        bot.delete_message(call.message.chat.id, call.message.message_id)
+        bot.send_message(admin_id, admin_msg)
+        bot.answer_callback_query(call.id, "готово")
         return
-    if t.status != TicketStatus.NEW.value:
-        bot.answer_callback_query(call.id, f"уже обработана: {t.status}", show_alert=True)
+
+    if data == "admin_add_user":
+        msg = bot.send_message(call.message.chat.id, "введи юзернейм или айди")
+        bot.register_next_step_handler(msg, add_user_step)
+        bot.answer_callback_query(call.id)
         return
-    if action == "accept":
-        update_ticket_status(ticket_id, TicketStatus.ACCEPTED)
-        user_msg = "ваша заявка принята, отправьте номер для спама"
-        admin_msg = f"заявка #{ticket_id} принята"
+
+    if data == "admin_block_user":
+        users = list_active_users()
+        if not users:
+            bot.send_message(call.message.chat.id, "нет активных пользователей")
+            bot.answer_callback_query(call.id)
+            return
+        for u in users:
+            markup = telebot.types.InlineKeyboardMarkup()
+            markup.row(telebot.types.InlineKeyboardButton("заблокировать", callback_data=f"block:{u.user_id}"))
+            bot.send_message(call.message.chat.id,
+                             f"id: {u.user_id}, username: @{u.username}, статус: {u.status}",
+                             reply_markup=markup)
+        bot.answer_callback_query(call.id)
+        return
+
+    if data.startswith("block:"):
+        user_id = int(data.split(":")[1])
+        last = get_last_ticket_by_user(user_id)
+        if not last:
+            bot.answer_callback_query(call.id, "пользователь не найден", show_alert=True)
+            return
+        if last.status == TicketStatus.REJECTED.value:
+            bot.answer_callback_query(call.id, "уже заблокирован", show_alert=True)
+            return
+        update_ticket_status(last.id, TicketStatus.REJECTED)
+        try:
+            bot.send_message(user_id, "ты заблокирован иди нахуй")
+        except:
+            pass
+        bot.delete_message(call.message.chat.id, call.message.message_id)
+        bot.send_message(admin_id, f"пользователь {user_id} заблокирован")
+        bot.answer_callback_query(call.id, "заблокирован")
+        return
+
+    if data == "admin_clear_db":
+        clear_db()
+        bot.send_message(call.message.chat.id, "база очищена")
+        bot.answer_callback_query(call.id)
+        return
+
+    if data == "admin_pause":
+        global bot_paused
+        bot_paused = True
+        bot.send_message(call.message.chat.id, "бот остановлен", reply_markup=admin_menu())
+        bot.answer_callback_query(call.id)
+        return
+
+    if data == "admin_resume":
+        global bot_paused
+        bot_paused = False
+        bot.send_message(call.message.chat.id, "бот включён", reply_markup=admin_menu())
+        accepted = get_all_accepted_users()
+        for uid in accepted:
+            try:
+                bot.send_message(uid, "тех работы окончены можете пользоваться ботом")
+            except:
+                pass
+        bot.answer_callback_query(call.id)
+        return
+
+def add_user_step(m):
+    if m.from_user.id != admin_id:
+        return
+    text = m.text.strip()
+    if text.isdigit():
+        user_id = int(text)
+        username = ""
     else:
-        update_ticket_status(ticket_id, TicketStatus.REJECTED)
-        user_msg = "иди нахуй"
-        admin_msg = f"заявка #{ticket_id} отклонена"
-    try:
-        bot.send_message(t.user_id, user_msg)
-    except Exception as e:
-        logger.warning(f"не отправить юзеру {t.user_id}: {e}")
-    bot.delete_message(call.message.chat.id, call.message.message_id)
-    bot.send_message(admin_id, admin_msg)
-    bot.answer_callback_query(call.id, "готово")
+        if text.startswith("@"):
+            text = text[1:]
+        username = text
+        with closing(get_conn()) as conn:
+            row = conn.execute("select user_id from tickets where username = ? limit 1", (username,)).fetchone()
+            if row:
+                user_id = row["user_id"]
+            else:
+                bot.reply_to(m, "не могу определить айди введи числовой айди")
+                return
+    last = get_last_ticket_by_user(user_id)
+    if last:
+        if last.status == TicketStatus.REJECTED.value:
+            update_ticket_status(last.id, TicketStatus.ACCEPTED)
+            bot.reply_to(m, f"пользователь {user_id} восстановлен")
+            try:
+                bot.send_message(user_id, "ты принят даун отправь номер")
+            except:
+                pass
+        else:
+            if last.status != TicketStatus.ACCEPTED.value:
+                update_ticket_status(last.id, TicketStatus.ACCEPTED)
+                bot.reply_to(m, f"пользователь {user_id} обновлён")
+                try:
+                    bot.send_message(user_id, "ты принят даун отправь номер")
+                except:
+                    pass
+            else:
+                bot.reply_to(m, f"пользователь {user_id} уже принят")
+    else:
+        create_ticket(user_id, username or "", "", TicketStatus.ACCEPTED.value)
+        bot.reply_to(m, f"пользователь {user_id} добавлен")
+        try:
+            bot.send_message(user_id, "ты принят даун отправь номер")
+        except:
+            pass
 
 @bot.message_handler(func=lambda m: True)
 def handle(m):
+    if check_paused(m):
+        return
     if m.from_user.id == admin_id:
-        # админ сразу может спамить
         pass
     else:
         last = get_last_ticket_by_user(m.from_user.id)
         if not last or last.status != TicketStatus.ACCEPTED.value:
-            bot.reply_to(m, "ваша заявка не принята, напишите /start")
+            bot.reply_to(m, "ваша заявка не принята напишите /start")
             return
     phone = ''.join(filter(str.isdigit, m.text.strip()))
     if len(phone) < 10:
@@ -240,6 +418,10 @@ def handle(m):
     if m.chat.id in active:
         bot.reply_to(m, "уже спамим")
         return
+    if m.from_user.id != admin_id:
+        last = get_last_ticket_by_user(m.from_user.id)
+        if last:
+            update_ticket_phone(last.id, phone)
     bot.reply_to(m, "спамлю")
     def worker(chat_id, phone):
         ua = UserAgent()
