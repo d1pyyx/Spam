@@ -256,6 +256,7 @@ def tickets_cmd(m):
 
 @bot.callback_query_handler(func=lambda call: True)
 def callback(call):
+    global bot_paused
     if call.from_user.id != admin_id:
         bot.answer_callback_query(call.id, "только админ", show_alert=True)
         return
@@ -336,14 +337,12 @@ def callback(call):
         return
 
     if data == "admin_pause":
-        global bot_paused
         bot_paused = True
         bot.send_message(call.message.chat.id, "бот остановлен", reply_markup=admin_menu())
         bot.answer_callback_query(call.id)
         return
 
     if data == "admin_resume":
-        global bot_paused
         bot_paused = False
         bot.send_message(call.message.chat.id, "бот включён", reply_markup=admin_menu())
         accepted = get_all_accepted_users()
